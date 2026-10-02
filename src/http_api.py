@@ -84,6 +84,10 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "daily-plan"]:
+                    query = parse_qs(parsed.query)
+                    date = query.get("date", [None])[0]
+                    return self._send(200, service.daily_plan(date))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api" and parts[1] != "entities":
@@ -129,6 +133,12 @@ def create_handler(service, rules, static_dir):
                     )
                 if len(parts) == 5 and parts[0] == "api" and parts[4] == "actions":
                     return self._send(200, service.transition(actor, parts[2], parts[3], self._body(), None))
+                if len(parts) == 3 and parts == ["api", "reinspection", "schedule"]:
+                    body = self._body()
+                    return self._send(
+                        201,
+                        service.schedule_reinspection(actor, body, self.headers.get("Idempotency-Key")),
+                    )
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     idem = self.headers.get("Idempotency-Key")

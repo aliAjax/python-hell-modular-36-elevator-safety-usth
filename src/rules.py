@@ -3,6 +3,10 @@ from datetime import datetime, timedelta
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
 
 
+# 复检每天可排名额
+REINSPECTION_DAILY_CAPACITY = 5
+
+
 def _require(data, fields):
     for field in fields:
         value = data.get(field)
@@ -34,6 +38,71 @@ def _positive(value, field):
     return number
 
 
+def _parse_date(value):
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _inspection_due(equipment, scheduled_date, lookup):
+    """检验是否到期：无通过检验记录，或最近一次通过检验已超过周期。"""
+    try:
+        interval = float(equipment["data"].get("inspection_interval_days", 0))
+    except (TypeError, ValueError):
+        interval = 0.0
+    passed = [
+        i for i in _all(lookup, "inspection")
+        if i["data"].get("equipment_id") == equipment["id"] and i["status"] == "passed"
+    ]
+    if not passed:
+        return True
+    latest = max(passed, key=lambda i: str(i["data"].get("scheduled_at", "")))
+    last_date = _parse_date(latest["data"].get("scheduled_at"))
+    if last_date is None:
+        return True
+    return last_date + timedelta(days=interval) < scheduled_date
+
+
+def _has_active_alarm(equipment_id, lookup):
+    for alarm in _all(lookup, "alarm"):
+        if alarm["data"].get("equipment_id") == equipment_id and alarm["status"] not in ("resolved", "closed", "false_alarm"):
+            return True
+    return False
+
+
+def _has_unfinished_rescue(equipment_id, lookup):
+    alarm_ids = {
+        alarm["id"] for alarm in _all(lookup, "alarm")
+        if alarm["data"].get("equipment_id") == equipment_id
+    }
+    for job in _all(lookup, "rescue_job"):
+        if job["data"].get("alarm_id") in alarm_ids and job["status"] not in ("completed", "aborted"):
+            return True
+    return False
+
+
+def reinspection_factors(equipment, scheduled_date, lookup):
+    """计算复检优先级因子：数字越小越优先。"""
+    due = _inspection_due(equipment, scheduled_date, lookup)
+    high_risk = equipment["data"].get("risk_level") == "high"
+    active_alarm = _has_active_alarm(equipment["id"], lookup)
+    unfinished_rescue = _has_unfinished_rescue(equipment["id"], lookup)
+    if active_alarm or unfinished_rescue:
+        priority = 2
+    elif due and high_risk:
+        priority = 0
+    else:
+        priority = 1
+    return {
+        "due": due,
+        "high_risk": high_risk,
+        "active_alarm": active_alarm,
+        "unfinished_rescue": unfinished_rescue,
+        "priority": priority,
+    }
+
+
 def _validate_equipment(data, lookup):
     asset_no = str(data.get("asset_no", "")).strip()
     if not asset_no:
@@ -41,6 +110,26 @@ def _validate_equipment(data, lookup):
     if _find_one(lookup, "equipment", "asset_no", asset_no):
         raise ConflictError("equipment asset_no already exists: " + asset_no)
     _positive(data.get("inspection_interval_days"), "inspection_interval_days")
+    risk = str(data.get("risk_level", "low")).strip().lower()
+    if risk not in ("high", "low"):
+        raise ValidationError("risk_level must be high or low")
+    data["risk_level"] = risk
+
+
+def _validate_reinspection(data, lookup):
+    equipment = _find_one(lookup, "equipment", "id", data.get("equipment_id"))
+    if not equipment:
+        raise ValidationError("reinspection requires equipment")
+    scheduled_date = _parse_date(data.get("scheduled_date"))
+    if scheduled_date is None:
+        raise ValidationError("scheduled_date must be ISO-8601 date")
+    data["scheduled_date"] = scheduled_date.isoformat()
+    for item in _all(lookup, "reinspection"):
+        if item["data"].get("equipment_id") == equipment["id"] and item["status"] in ("scheduled", "queued"):
+            raise ConflictError(
+                "equipment already has an active reinspection: %s (slot %s)"
+                % (item["id"], item["data"].get("scheduled_date"))
+            )
 
 
 def _validate_inspection(data, lookup):
@@ -105,12 +194,23 @@ def _grant_permit(actor, entity, data, lookup):
     equipment = _find_one(lookup, "equipment", "id", entity["data"].get("equipment_id"))
     if not equipment or equipment["status"] not in ("in_service", "suspended"):
         raise ConflictError("permit can only be granted for a serviceable equipment")
+    for item in _all(lookup, "reinspection"):
+        if item["data"].get("equipment_id") == equipment["id"] and item["status"] in ("scheduled", "queued"):
+            raise ConflictError("permit frozen until reinspection %s passes" % item["id"])
     inspections = [i for i in _all(lookup, "inspection") if i["data"].get("equipment_id") == equipment["id"] and i["status"] == "passed"]
-    if not inspections:
-        raise ConflictError("permit requires a passed inspection")
+    reinspections = [r for r in _all(lookup, "reinspection") if r["data"].get("equipment_id") == equipment["id"] and r["status"] == "passed"]
+    if not inspections and not reinspections:
+        raise ConflictError("permit requires a passed inspection or reinspection")
     if [r for r in _all(lookup, "remediation") if r["data"].get("equipment_id") == equipment["id"] and r["status"] != "closed"]:
         raise ConflictError("permit blocked by open remediation")
     return {"granted_by": actor.user_id, "granted_at": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
+
+
+def _pass_reinspection(actor, entity, data, lookup):
+    equipment = _find_one(lookup, "equipment", "id", entity["data"].get("equipment_id"))
+    if equipment and equipment["data"].get("risk_level") == "high" and actor.role not in ("admin", "senior_inspector"):
+        raise PermissionDenied("high-risk reinspection requires senior inspector")
+    return {"passed_by": actor.user_id}
 
 
 def _verify_remediation(actor, entity, data, lookup):
@@ -130,12 +230,12 @@ class RuleEngine:
     ALIASES = {
         "equipments": "equipment", "inspections": "inspection", "maintenances": "maintenance",
         "alarms": "alarm", "rescue_jobs": "rescue_job", "remediations": "remediation",
-        "permits": "permit",
+        "permits": "permit", "reinspections": "reinspection",
     }
     INITIAL_STATUS = {
         "equipment": "in_service", "inspection": "scheduled", "maintenance": "planned",
         "alarm": "received", "rescue_job": "dispatched", "remediation": "open",
-        "permit": "blocked",
+        "permit": "blocked", "reinspection": "queued",
     }
     TRANSITIONS = {
         "equipment": {
@@ -147,6 +247,11 @@ class RuleEngine:
             "pass": (("scheduled",), "passed"),
             "fail": (("scheduled",), "failed"),
             "reschedule": (("failed",), "scheduled"),
+        },
+        "reinspection": {
+            "pass": (("scheduled",), "passed"),
+            "fail": (("scheduled",), "failed"),
+            "void": (("scheduled", "queued"), "voided"),
         },
         "maintenance": {
             "start": (("planned",), "in_progress"),
@@ -179,6 +284,7 @@ class RuleEngine:
     CREATE_REQUIRED = {
         "equipment": ("asset_no", "equipment_type", "location", "inspection_interval_days"),
         "inspection": ("equipment_id", "scheduled_at", "cycle_days"),
+        "reinspection": ("equipment_id", "scheduled_date"),
         "maintenance": ("equipment_id", "work_type", "planned_at"),
         "alarm": ("equipment_id", "code", "occurred_at"),
         "rescue_job": ("alarm_id", "dedupe_key", "team"),
@@ -197,6 +303,7 @@ class RuleEngine:
     CREATE_ROLES = {
         "equipment": ("admin", "inspector"),
         "inspection": ("admin", "inspector"),
+        "reinspection": ("admin", "dispatcher"),
         "maintenance": ("admin", "maintenance"),
         "alarm": ("admin", "dispatcher", "inspector"),
         "rescue_job": ("admin", "dispatcher"),
@@ -210,6 +317,9 @@ class RuleEngine:
         "pass": ("admin", "inspector"),
         "fail": ("admin", "inspector"),
         "reschedule": ("admin", "inspector"),
+        ("reinspection", "pass"): ("admin", "senior_inspector", "inspector"),
+        ("reinspection", "fail"): ("admin", "senior_inspector", "inspector"),
+        ("reinspection", "void"): ("admin", "dispatcher"),
         "start": ("admin", "maintenance"),
         "complete": ("admin", "maintenance", "dispatcher"),
         "dispatch": ("admin", "dispatcher"),
@@ -229,6 +339,7 @@ class RuleEngine:
     CUSTOM_CREATE = {
         "equipment": lambda a, d, l: _validate_equipment(d, l),
         "inspection": lambda a, d, l: _validate_inspection(d, l),
+        "reinspection": lambda a, d, l: _validate_reinspection(d, l),
         "maintenance": lambda a, d, l: _validate_maintenance(d, l),
         "alarm": lambda a, d, l: _validate_alarm(d, l),
         "rescue_job": lambda a, d, l: _validate_rescue(d, l),
@@ -239,10 +350,17 @@ class RuleEngine:
         ("permit", "grant"): _grant_permit,
         ("remediation", "verify"): _verify_remediation,
         ("alarm", "close"): _complete_rescue,
+        ("reinspection", "pass"): _pass_reinspection,
     }
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
+
+    def parse_date(self, value):
+        return _parse_date(value)
+
+    def priority_factors(self, equipment, scheduled_date, lookup=None):
+        return reinspection_factors(equipment, scheduled_date, lookup)
 
     def initial_status(self, kind, data=None):
         kind = self.normalize_kind(kind)

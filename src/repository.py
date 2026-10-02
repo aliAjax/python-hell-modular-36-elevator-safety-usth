@@ -3,6 +3,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 from .domain import ConflictError, NotFoundError
+from .rules import REINSPECTION_DAILY_CAPACITY
 
 
 def utcnow():
@@ -34,6 +35,12 @@ class SQLiteRepository:
                 );
                 CREATE INDEX IF NOT EXISTS idx_entities_kind_status
                     ON entities(kind, status);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_reinspection_active_equipment
+                    ON entities(json_extract(data, '$.equipment_id'))
+                    WHERE kind = 'reinspection' AND status IN ('scheduled', 'queued');
+                CREATE INDEX IF NOT EXISTS idx_reinspection_date
+                    ON entities(json_extract(data, '$.scheduled_date'))
+                    WHERE kind = 'reinspection';
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     entity_id TEXT NOT NULL,
@@ -79,6 +86,150 @@ class SQLiteRepository:
                 (entity_id, kind, status, payload, actor_id, now, now),
             )
         return self.get_entity(entity_id)
+
+    def count_reinspections(self, scheduled_date, status):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS c FROM entities "
+                "WHERE kind = 'reinspection' AND status = ? "
+                "AND json_extract(data, '$.scheduled_date') = ?",
+                (status, scheduled_date),
+            ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def schedule_reinspection(self, entity_id, payload, actor_id, capacity):
+        """Atomically assign a slot, queue when full, and bump lowest priority when needed."""
+        scheduled_date = payload["scheduled_date"]
+        priority = int(payload.get("priority", 1))
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT id, data, version FROM entities "
+                "WHERE kind = 'reinspection' AND status = 'scheduled' "
+                "AND json_extract(data, '$.scheduled_date') = ? "
+                "ORDER BY json_extract(data, '$.priority') DESC, created_at",
+                (scheduled_date,),
+            ).fetchall()
+            status = "scheduled"
+            bump = None
+            if priority == 2:
+                status = "queued"
+            elif len(rows) >= int(capacity):
+                target = rows[0]
+                target_priority = int(json.loads(target["data"]).get("priority", 1))
+                if priority == 0 and target_priority > priority:
+                    bump = target
+                else:
+                    status = "queued"
+            queued_count = int(connection.execute(
+                "SELECT COUNT(*) AS c FROM entities "
+                "WHERE kind = 'reinspection' AND status = 'queued' "
+                "AND json_extract(data, '$.scheduled_date') = ?",
+                (scheduled_date,),
+            ).fetchone()["c"])
+            if bump is not None:
+                bump_data = json.loads(bump["data"])
+                bump_data["queue_position"] = queued_count + 1
+                connection.execute(
+                    "UPDATE entities SET status = 'queued', version = version + 1, data = ?, updated_at = ? "
+                    "WHERE id = ? AND version = ?",
+                    (json.dumps(bump_data, ensure_ascii=False, sort_keys=True), now, bump["id"], bump["version"]),
+                )
+            elif status == "queued":
+                payload["queue_position"] = queued_count + 1
+            connection.execute(
+                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                "VALUES (?, 'reinspection', ?, 1, ?, ?, ?, ?)",
+                (entity_id, status, json.dumps(payload, ensure_ascii=False, sort_keys=True), actor_id, now, now),
+            )
+            connection.commit()
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            if "reinspection_active_equipment" in str(exc):
+                raise ConflictError("equipment already has an active reinspection")
+            raise
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(entity_id)
+
+    def promote_queued_reinspections(self, scheduled_date, capacity):
+        """Promote highest-priority queued reinspections into freed slots."""
+        now = utcnow()
+        promoted = []
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            scheduled_count = int(connection.execute(
+                "SELECT COUNT(*) AS c FROM entities "
+                "WHERE kind = 'reinspection' AND status = 'scheduled' "
+                "AND json_extract(data, '$.scheduled_date') = ?",
+                (scheduled_date,),
+            ).fetchone()["c"])
+            while scheduled_count < int(capacity):
+                row = connection.execute(
+                    "SELECT id, data, version FROM entities "
+                    "WHERE kind = 'reinspection' AND status = 'queued' "
+                    "AND json_extract(data, '$.scheduled_date') = ? "
+                    "ORDER BY json_extract(data, '$.priority') ASC, "
+                    "json_extract(data, '$.queue_position') ASC, created_at LIMIT 1",
+                    (scheduled_date,),
+                ).fetchone()
+                if not row:
+                    break
+                data = json.loads(row["data"])
+                data.pop("queue_position", None)
+                connection.execute(
+                    "UPDATE entities SET status = 'scheduled', version = version + 1, data = ?, updated_at = ? "
+                    "WHERE id = ? AND version = ?",
+                    (json.dumps(data, ensure_ascii=False, sort_keys=True), now, row["id"], row["version"]),
+                )
+                promoted.append(row["id"])
+                scheduled_count += 1
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return promoted
+
+    def void_reinspections_for_equipment(self, equipment_id):
+        """Void all active reinspections for an equipment and free their slots."""
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT id, data, version FROM entities "
+                "WHERE kind = 'reinspection' AND status IN ('scheduled', 'queued') "
+                "AND json_extract(data, '$.equipment_id') = ?",
+                (equipment_id,),
+            ).fetchall()
+            affected_dates = set()
+            for row in rows:
+                data = json.loads(row["data"])
+                affected_dates.add(data.get("scheduled_date"))
+                data["voided_reason"] = "equipment_status_changed"
+                connection.execute(
+                    "UPDATE entities SET status = 'voided', version = version + 1, data = ?, updated_at = ? "
+                    "WHERE id = ? AND version = ?",
+                    (json.dumps(data, ensure_ascii=False, sort_keys=True), now, row["id"], row["version"]),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        for scheduled_date in affected_dates:
+            if scheduled_date:
+                self.promote_queued_reinspections(scheduled_date, REINSPECTION_DAILY_CAPACITY)
+        return [row["id"] for row in rows]
 
     def get_entity(self, entity_id):
         with self._connect() as connection:
