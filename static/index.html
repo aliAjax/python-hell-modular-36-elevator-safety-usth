@@ -7,5 +7,11 @@
 GET  /api/&lt;kind&gt;
 POST /api/&lt;kind&gt;
 GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre></main>
+POST /api/entities/&lt;id&gt;/actions
+GET  /api/daily_plans/&lt;id&gt;/board
+POST /api/daily_plans/&lt;id&gt;/rerank</pre>
+<h2>当日复检排程</h2><pre>POST /api/daily_plans      {"plan_date":"2026-10-02","reinspection_capacity":8}
+POST /api/reinspections   {"plan_id":"...","equipment_id":"..."}
+优先级：无未结报警/救援 &gt; 高风险 &gt; 检验逾期/到期 &gt; 更早提交；满员则排队。
+设备状态变化自动作废已排复检并退回名额；高风险电梯需主任检验员签收。</pre></main>
 <script>async function checkHealth(){const r=await fetch('/health');document.getElementById('result').textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>

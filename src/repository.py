@@ -6,7 +6,7 @@ from .domain import ConflictError, NotFoundError
 
 
 def utcnow():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 class SQLiteRepository:
@@ -203,3 +203,96 @@ class SQLiteRepository:
         with self._connect() as connection:
             connection.execute("SELECT 1").fetchone()
         return True
+
+    def transaction(self):
+        """Open a BEGIN IMMEDIATE transaction; concurrent booking calls serialize here."""
+        return TransactionGateway(self)
+
+
+class TransactionGateway:
+    """Live connection used by the daily-plan booking/ranking use case."""
+
+    def __init__(self, repository):
+        self.repository = repository
+        self._connection = None
+
+    def __enter__(self):
+        self._connection = self.repository._connect()
+        self._connection.execute("BEGIN IMMEDIATE")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self._connection.commit()
+        else:
+            self._connection.rollback()
+        self._connection.close()
+        self._connection = None
+        return False
+
+    def get(self, entity_id):
+        row = self._connection.execute(
+            "SELECT * FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
+        return self.repository._entity_from_row(row) if row else None
+
+    def list(self, kind=None, status=None):
+        clauses = []
+        params = []
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = self._connection.execute(
+            "SELECT * FROM entities" + where + " ORDER BY created_at, id", params
+        ).fetchall()
+        return [self.repository._entity_from_row(row) for row in rows]
+
+    def find(self, kind, field, value):
+        entities = self.list(kind=kind)
+        if field == "*":
+            return entities
+        return [
+            entity
+            for entity in entities
+            if (entity["id"] == value if field == "id" else entity["data"].get(field) == value)
+        ]
+
+    def insert(self, entity_id, kind, status, data, actor_id):
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        self._connection.execute(
+            "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+            "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
+            (entity_id, kind, status, payload, actor_id, now, now),
+        )
+        return self.get(entity_id)
+
+    def apply_status(self, entity, status, data):
+        """Set status/data and bump version; callers must re-read inside the transaction."""
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        self._connection.execute(
+            "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? WHERE id = ?",
+            (status, payload, now, entity["id"]),
+        )
+        return self.get(entity["id"])
+
+    def audit(self, entity_id, actor, action, from_status, to_status, detail=None):
+        self._connection.execute(
+            "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                entity_id,
+                actor.user_id,
+                actor.role,
+                action,
+                from_status,
+                to_status,
+                json.dumps(detail or {}, ensure_ascii=False, sort_keys=True),
+                utcnow(),
+            ),
+        )
